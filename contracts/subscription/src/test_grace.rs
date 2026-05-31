@@ -60,6 +60,8 @@ fn setup_with_grace(grace_period: u64) -> Fixture<'static> {
         &token,
         &PLAN_AMOUNT,
         &MONTHLY,
+        &None,
+        &0,
     );
     if grace_period > 0 {
         client.set_plan_grace_period(&merchant, &plan_id, &grace_period);

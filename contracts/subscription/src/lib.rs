@@ -5,6 +5,8 @@ mod errors;
 mod test_grace;
 #[cfg(test)]
 mod test_refund;
+#[cfg(test)]
+mod test_upgrades_downgrades;
 mod types;
 
 use errors::SubscriptionError;
@@ -97,6 +99,8 @@ impl SubscriptionContract {
         token: Address,
         amount: i128,
         interval: u64,
+        creator: Option<Address>,
+        trial_period: u64,
     ) -> u64 {
         merchant.require_auth();
 
@@ -131,6 +135,8 @@ impl SubscriptionContract {
             active: true,
             created_at: env.ledger().timestamp(),
             grace_period: 0,
+            creator,
+            trial_period,
         };
         env.storage()
             .persistent()
@@ -232,6 +238,7 @@ impl SubscriptionContract {
             created_at: env.ledger().timestamp(),
             last_charged: 0,
             past_due_since: 0,
+            pending_downgrade_plan_id: 0,
         };
         env.storage()
             .persistent()
@@ -281,6 +288,14 @@ impl SubscriptionContract {
             let current_seq = env.ledger().sequence();
             token_client.approve(&sub.customer, &spender, &0_i128, &current_seq);
         }
+
+        // Emit SubExpired
+        types::SubExpired {
+            subscription_id: sub.id,
+            plan_id: sub.plan_id,
+            customer: sub.customer.clone(),
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
     }
 
     // ── Billing ───────────────────────────────────────────────────────────────
@@ -338,10 +353,20 @@ impl SubscriptionContract {
         if sub.status != SubscriptionStatus::Active {
             panic_with_error!(&env, SubscriptionError::SubscriptionNotActive);
         }
-        let plan = load_plan(&env, sub.plan_id);
+        let mut plan = load_plan(&env, sub.plan_id);
         let now = env.ledger().timestamp();
-        if sub.last_charged > 0 && now < sub.last_charged.saturating_add(plan.interval) {
+        if sub.last_charged > 0 {
+            if now < sub.last_charged.saturating_add(plan.interval) {
+                panic_with_error!(&env, SubscriptionError::ChargeTooEarly);
+            }
+        } else if now < sub.created_at.saturating_add(plan.trial_period) {
             panic_with_error!(&env, SubscriptionError::ChargeTooEarly);
+        }
+
+        if sub.pending_downgrade_plan_id != 0 {
+            sub.plan_id = sub.pending_downgrade_plan_id;
+            sub.pending_downgrade_plan_id = 0;
+            plan = load_plan(&env, sub.plan_id);
         }
 
         let token_client = token::TokenClient::new(&env, &plan.token);
@@ -352,13 +377,22 @@ impl SubscriptionContract {
             panic_with_error!(&env, SubscriptionError::InsufficientAllowance);
         }
 
-        token_client.transfer_from(&spender, &sub.customer, &plan.merchant, &plan.amount);
+        let recipient = plan.creator.as_ref().unwrap_or(&plan.merchant);
+        token_client.transfer_from(&spender, &sub.customer, recipient, &plan.amount);
 
         sub.last_charged = now;
         sub.past_due_since = 0;
         env.storage()
             .persistent()
             .set(&DataKey::Subscription(sub_id), &sub);
+
+        // Emit SubRenewed
+        types::SubRenewed {
+            subscription_id: sub.id,
+            plan_id: sub.plan_id,
+            customer: sub.customer.clone(),
+            timestamp: now,
+        }.publish(&env);
     }
 
     /// Forgiving variant of [`charge`]. Drives the subscription's billing
@@ -419,6 +453,14 @@ impl SubscriptionContract {
         env.storage()
             .persistent()
             .set(&DataKey::Subscription(sub_id), &sub);
+
+        // Emit SubExpired
+        types::SubExpired {
+            subscription_id: sub.id,
+            plan_id: sub.plan_id,
+            customer: sub.customer.clone(),
+            timestamp: now,
+        }.publish(&env);
     }
 
     /// Cancel a subscription and refund the unused portion of the current
@@ -443,15 +485,17 @@ impl SubscriptionContract {
             panic_with_error!(&env, SubscriptionError::SubscriptionNotActive);
         }
         let plan = load_plan(&env, sub.plan_id);
+        let source = plan.creator.as_ref().unwrap_or(&plan.merchant);
         let is_customer = sub.customer == caller;
         let is_merchant = plan.merchant == caller;
-        if !is_customer && !is_merchant {
+        let is_creator = plan.creator.as_ref().map_or(false, |c| c == &caller);
+        if !is_customer && !is_merchant && !is_creator {
             panic_with_error!(&env, SubscriptionError::NotAuthorized);
         }
         // Whichever party did not initiate must still authorize so refunds
         // require mutual consent.
         if is_customer {
-            plan.merchant.require_auth();
+            source.require_auth();
         } else {
             sub.customer.require_auth();
         }
@@ -461,18 +505,23 @@ impl SubscriptionContract {
             panic_with_error!(&env, SubscriptionError::NothingToRefund);
         }
 
-        // Pull the refund from the merchant's balance into the customer's.
-        // The merchant's earlier `approve(contract, ...)` is what makes this
-        // possible — without it the transfer fails and the subscription is
-        // left untouched.
+        // Pull the refund from the merchant's/creator's balance into the customer's.
         let token_client = token::TokenClient::new(&env, &plan.token);
         let spender = env.current_contract_address();
-        token_client.transfer_from(&spender, &plan.merchant, &sub.customer, &refund_amount);
+        token_client.transfer_from(&spender, source, &sub.customer, &refund_amount);
 
         sub.status = SubscriptionStatus::Cancelled;
         env.storage()
             .persistent()
             .set(&DataKey::Subscription(sub_id), &sub);
+
+        // Emit SubExpired
+        types::SubExpired {
+            subscription_id: sub.id,
+            plan_id: sub.plan_id,
+            customer: sub.customer.clone(),
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
     }
 
     /// Read-only helper: how much would be refunded if the subscription
@@ -482,6 +531,86 @@ impl SubscriptionContract {
         let sub = load_subscription(&env, sub_id);
         let plan = load_plan(&env, sub.plan_id);
         prorated_refund(&sub, &plan, env.ledger().timestamp())
+    }
+
+    /// Upgrade a subscription immediately.
+    /// Deducts (new_plan.amount - prorated_refund_of_old_plan) from customer and resets billing cycle.
+    pub fn upgrade_subscription(env: Env, customer: Address, sub_id: u64, new_plan_id: u64) {
+        customer.require_auth();
+        let mut sub = load_subscription(&env, sub_id);
+        if sub.customer != customer {
+            panic_with_error!(&env, SubscriptionError::NotAuthorized);
+        }
+        if sub.status != SubscriptionStatus::Active {
+            panic_with_error!(&env, SubscriptionError::SubscriptionNotActive);
+        }
+        let old_plan = load_plan(&env, sub.plan_id);
+        let new_plan = load_plan(&env, new_plan_id);
+        if !new_plan.active {
+            panic_with_error!(&env, SubscriptionError::PlanNotActive);
+        }
+        if old_plan.token != new_plan.token {
+            panic_with_error!(&env, SubscriptionError::TokenNotAccepted);
+        }
+
+        let now = env.ledger().timestamp();
+        let refund = prorated_refund(&sub, &old_plan, now);
+        let mut upgrade_cost = new_plan.amount.saturating_sub(refund);
+        if upgrade_cost < 0 {
+            upgrade_cost = 0;
+        }
+
+        let token_client = token::TokenClient::new(&env, &new_plan.token);
+        let spender = env.current_contract_address();
+
+        if upgrade_cost > 0 {
+            let allowance = token_client.allowance(&sub.customer, &spender);
+            if allowance < upgrade_cost {
+                panic_with_error!(&env, SubscriptionError::InsufficientAllowance);
+            }
+            let recipient = new_plan.creator.as_ref().unwrap_or(&new_plan.merchant);
+            token_client.transfer_from(&spender, &sub.customer, recipient, &upgrade_cost);
+        }
+
+        sub.plan_id = new_plan_id;
+        sub.last_charged = now;
+        sub.pending_downgrade_plan_id = 0;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(sub_id), &sub);
+
+        // Emit SubRenewed
+        types::SubRenewed {
+            subscription_id: sub.id,
+            plan_id: sub.plan_id,
+            customer: sub.customer.clone(),
+            timestamp: now,
+        }.publish(&env);
+    }
+
+    /// Schedule a deferred downgrade to be applied at the end of the current billing cycle.
+    pub fn downgrade_subscription(env: Env, customer: Address, sub_id: u64, new_plan_id: u64) {
+        customer.require_auth();
+        let mut sub = load_subscription(&env, sub_id);
+        if sub.customer != customer {
+            panic_with_error!(&env, SubscriptionError::NotAuthorized);
+        }
+        if sub.status != SubscriptionStatus::Active {
+            panic_with_error!(&env, SubscriptionError::SubscriptionNotActive);
+        }
+        let old_plan = load_plan(&env, sub.plan_id);
+        let new_plan = load_plan(&env, new_plan_id);
+        if !new_plan.active {
+            panic_with_error!(&env, SubscriptionError::PlanNotActive);
+        }
+        if old_plan.token != new_plan.token {
+            panic_with_error!(&env, SubscriptionError::TokenNotAccepted);
+        }
+
+        sub.pending_downgrade_plan_id = new_plan_id;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(sub_id), &sub);
     }
 }
 
@@ -493,26 +622,55 @@ impl SubscriptionContract {
 /// terminal subscriptions via `ChargeOutcome::Skipped`).
 fn step_billing_cycle(env: &Env, sub_id: u64) -> ChargeOutcome {
     let mut sub = load_subscription(env, sub_id);
-    let plan = load_plan(env, sub.plan_id);
+    let mut plan = load_plan(env, sub.plan_id);
     let now = env.ledger().timestamp();
 
     match sub.status {
         SubscriptionStatus::Active => {
-            if sub.last_charged > 0 && now < sub.last_charged.saturating_add(plan.interval) {
+            if sub.last_charged > 0 {
+                if now < sub.last_charged.saturating_add(plan.interval) {
+                    return ChargeOutcome::NotDueYet;
+                }
+            } else if now < sub.created_at.saturating_add(plan.trial_period) {
                 return ChargeOutcome::NotDueYet;
             }
+
+            if sub.pending_downgrade_plan_id != 0 {
+                sub.plan_id = sub.pending_downgrade_plan_id;
+                sub.pending_downgrade_plan_id = 0;
+                plan = load_plan(env, sub.plan_id);
+            }
+
             if try_pull_charge(env, &sub, &plan) {
                 sub.last_charged = now;
                 sub.past_due_since = 0;
                 env.storage()
                     .persistent()
                     .set(&DataKey::Subscription(sub_id), &sub);
+
+                // Emit SubRenewed
+                types::SubRenewed {
+                    subscription_id: sub.id,
+                    plan_id: sub.plan_id,
+                    customer: sub.customer.clone(),
+                    timestamp: now,
+                }.publish(env);
+
                 ChargeOutcome::Charged
             } else if plan.grace_period == 0 {
                 sub.status = SubscriptionStatus::Terminated;
                 env.storage()
                     .persistent()
                     .set(&DataKey::Subscription(sub_id), &sub);
+
+                // Emit SubExpired
+                types::SubExpired {
+                    subscription_id: sub.id,
+                    plan_id: sub.plan_id,
+                    customer: sub.customer.clone(),
+                    timestamp: now,
+                }.publish(env);
+
                 ChargeOutcome::Terminated
             } else {
                 sub.status = SubscriptionStatus::PastDue;
@@ -524,6 +682,12 @@ fn step_billing_cycle(env: &Env, sub_id: u64) -> ChargeOutcome {
             }
         }
         SubscriptionStatus::PastDue => {
+            if sub.pending_downgrade_plan_id != 0 {
+                sub.plan_id = sub.pending_downgrade_plan_id;
+                sub.pending_downgrade_plan_id = 0;
+                plan = load_plan(env, sub.plan_id);
+            }
+
             if try_pull_charge(env, &sub, &plan) {
                 sub.status = SubscriptionStatus::Active;
                 sub.last_charged = now;
@@ -531,12 +695,30 @@ fn step_billing_cycle(env: &Env, sub_id: u64) -> ChargeOutcome {
                 env.storage()
                     .persistent()
                     .set(&DataKey::Subscription(sub_id), &sub);
+
+                // Emit SubRenewed
+                types::SubRenewed {
+                    subscription_id: sub.id,
+                    plan_id: sub.plan_id,
+                    customer: sub.customer.clone(),
+                    timestamp: now,
+                }.publish(env);
+
                 ChargeOutcome::Recovered
             } else if now > sub.past_due_since.saturating_add(plan.grace_period) {
                 sub.status = SubscriptionStatus::Terminated;
                 env.storage()
                     .persistent()
                     .set(&DataKey::Subscription(sub_id), &sub);
+
+                // Emit SubExpired
+                types::SubExpired {
+                    subscription_id: sub.id,
+                    plan_id: sub.plan_id,
+                    customer: sub.customer.clone(),
+                    timestamp: now,
+                }.publish(env);
+
                 ChargeOutcome::Terminated
             } else {
                 ChargeOutcome::EnteredGrace
@@ -556,7 +738,8 @@ fn try_pull_charge(env: &Env, sub: &Subscription, plan: &Plan) -> bool {
     if allowance < plan.amount {
         return false;
     }
-    token_client.transfer_from(&spender, &sub.customer, &plan.merchant, &plan.amount);
+    let recipient = plan.creator.as_ref().unwrap_or(&plan.merchant);
+    token_client.transfer_from(&spender, &sub.customer, recipient, &plan.amount);
     true
 }
 

@@ -64,6 +64,8 @@ fn setup_charged_subscription() -> Fixture<'static> {
         &token,
         &PLAN_AMOUNT,
         &MONTHLY,
+        &None,
+        &0,
     );
     let sub_id = client.subscribe(&customer, &plan_id);
 
@@ -107,6 +109,8 @@ fn test_quote_zero_when_never_charged() {
         &token,
         &PLAN_AMOUNT,
         &MONTHLY,
+        &None,
+        &0,
     );
     let sub_id = client.subscribe(&customer, &plan_id);
 

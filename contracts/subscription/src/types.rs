@@ -1,4 +1,22 @@
-use soroban_sdk::{contracttype, Address, String};
+use soroban_sdk::{contracttype, contractevent, Address, String};
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubRenewed {
+    pub subscription_id: u64,
+    pub plan_id: u64,
+    pub customer: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubExpired {
+    pub subscription_id: u64,
+    pub plan_id: u64,
+    pub customer: Address,
+    pub timestamp: u64,
+}
 
 #[contracttype]
 pub enum DataKey {
@@ -28,6 +46,8 @@ pub struct Plan {
     /// Seconds a subscription remains in `PastDue` before being terminated.
     /// `0` means no grace — a failed charge terminates immediately.
     pub grace_period: u64,
+    pub creator: Option<Address>,
+    pub trial_period: u64,
 }
 
 /// An active or cancelled subscription held by a customer.
@@ -44,6 +64,7 @@ pub struct Subscription {
     /// Timestamp at which the subscription entered `PastDue`. `0` if not
     /// currently past due. Used to enforce the plan's grace period.
     pub past_due_since: u64,
+    pub pending_downgrade_plan_id: u64,
 }
 
 #[contracttype]
