@@ -1,7 +1,7 @@
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::token::StellarAssetClient;
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{vec, Address, Env};
 
 fn setup() -> (Env, Address, CrowdfundContractClient<'static>, Address, Address, Address) {
     let env = Env::default();
@@ -20,6 +20,8 @@ fn setup() -> (Env, Address, CrowdfundContractClient<'static>, Address, Address,
 
     (env, contract, client, token, organizer, contributor)
 }
+
+// ── Existing init / contribute tests ─────────────────────────────────────────
 
 #[test]
 fn test_init_campaign_stores_goal_and_deadline() {
@@ -95,4 +97,236 @@ fn test_contribute_after_deadline_panics() {
     env.ledger().with_mut(|l| l.timestamp += 200);
     StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
     client.contribute(&contributor, &1_000);
+}
+
+// ── #302 – Pledge tracking and accounting ────────────────────────────────────
+
+#[test]
+fn test_pledge_tracked_per_contributor() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &10_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &4_000);
+    client.contribute(&contributor, &1_500);
+    client.contribute(&contributor, &2_500);
+
+    assert_eq!(client.pledge_of(&contributor), 4_000);
+    assert_eq!(client.raised(), 4_000);
+}
+
+#[test]
+fn test_multiple_contributors_sum_correctly() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let contributor2 = Address::generate(&env);
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &10_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &3_000);
+    StellarAssetClient::new(&env, &token).mint(&contributor2, &7_000);
+    client.contribute(&contributor, &3_000);
+    client.contribute(&contributor2, &7_000);
+
+    assert_eq!(client.raised(), 10_000);
+    assert_eq!(client.pledge_of(&contributor), 3_000);
+    assert_eq!(client.pledge_of(&contributor2), 7_000);
+    assert!(client.goal_reached());
+}
+
+#[test]
+fn test_pledge_of_returns_zero_for_non_contributor() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let non_contributor = Address::generate(&env);
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &500);
+    client.contribute(&contributor, &500);
+
+    assert_eq!(client.pledge_of(&non_contributor), 0);
+}
+
+// ── #303 – Successful campaign execution ─────────────────────────────────────
+
+#[test]
+fn test_execute_campaign_transfers_to_organizer() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 100;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
+    client.contribute(&contributor, &1_000);
+
+    // Advance past deadline.
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    let token_client = StellarAssetClient::new(&env, &token);
+    let before = token_client.balance(&organizer);
+    client.execute_campaign();
+    let after = token_client.balance(&organizer);
+
+    assert_eq!(after - before, 1_000);
+    assert!(client.is_executed());
+}
+
+#[test]
+#[should_panic]
+fn test_execute_before_deadline_panics() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &500, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &500);
+    client.contribute(&contributor, &500);
+
+    // Deadline not yet passed.
+    client.execute_campaign();
+}
+
+#[test]
+#[should_panic]
+fn test_execute_when_goal_not_met_panics() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 100;
+    client.init_campaign(&organizer, &token, &5_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
+    client.contribute(&contributor, &1_000);
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.execute_campaign();
+}
+
+#[test]
+#[should_panic]
+fn test_execute_twice_panics() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 100;
+    client.init_campaign(&organizer, &token, &500, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &500);
+    client.contribute(&contributor, &500);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    client.execute_campaign();
+    client.execute_campaign();
+}
+
+// ── #304 – Failed campaign refunds ───────────────────────────────────────────
+
+#[test]
+fn test_claim_refund_returns_pledge_on_failed_campaign() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 100;
+    client.init_campaign(&organizer, &token, &5_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
+    client.contribute(&contributor, &1_000);
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    let token_client = StellarAssetClient::new(&env, &token);
+    let before = token_client.balance(&contributor);
+    client.claim_refund(&contributor);
+    let after = token_client.balance(&contributor);
+
+    assert_eq!(after - before, 1_000);
+    // Pledge zeroed after refund.
+    assert_eq!(client.pledge_of(&contributor), 0);
+}
+
+#[test]
+#[should_panic]
+fn test_claim_refund_before_deadline_panics() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &5_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
+    client.contribute(&contributor, &1_000);
+
+    client.claim_refund(&contributor);
+}
+
+#[test]
+#[should_panic]
+fn test_claim_refund_on_successful_campaign_panics() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 100;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
+    client.contribute(&contributor, &1_000);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    client.claim_refund(&contributor);
+}
+
+#[test]
+#[should_panic]
+fn test_claim_refund_with_no_pledge_panics() {
+    let (env, _contract, client, token, organizer, _contributor) = setup();
+    let non_backer = Address::generate(&env);
+    let deadline = env.ledger().timestamp() + 100;
+    client.init_campaign(&organizer, &token, &5_000, &deadline);
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.claim_refund(&non_backer);
+}
+
+#[test]
+#[should_panic]
+fn test_double_refund_panics() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 100;
+    client.init_campaign(&organizer, &token, &5_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
+    client.contribute(&contributor, &1_000);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    client.claim_refund(&contributor);
+    client.claim_refund(&contributor);
+}
+
+// ── #306 – Stretch goals tracking ────────────────────────────────────────────
+
+#[test]
+fn test_stretch_goals_activate_when_threshold_crossed() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+    client.set_stretch_goals(&vec![&env, 2_000_i128, 5_000_i128]);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &5_000);
+    client.contribute(&contributor, &2_000);
+    // First stretch goal crossed at 2_000.
+
+    client.contribute(&contributor, &3_000);
+    // Second stretch goal crossed at 5_000.
+
+    assert_eq!(client.raised(), 5_000);
+}
+
+#[test]
+fn test_stretch_goal_not_triggered_before_threshold() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+    client.set_stretch_goals(&vec![&env, 3_000_i128]);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
+    client.contribute(&contributor, &1_000);
+
+    // Only 1_000 raised — stretch goal at 3_000 not yet triggered.
+    assert_eq!(client.raised(), 1_000);
+}
+
+#[test]
+#[should_panic]
+fn test_set_stretch_goals_non_ascending_panics() {
+    let (env, _contract, client, token, organizer, _) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+    // 5_000 then 2_000 is not ascending — must panic.
+    client.set_stretch_goals(&vec![&env, 5_000_i128, 2_000_i128]);
 }

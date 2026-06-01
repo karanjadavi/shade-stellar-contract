@@ -10,4 +10,14 @@ pub enum CrowdfundError {
     InvalidDeadline = 4,
     InvalidAmount = 5,
     CampaignEnded = 6,
+    // Campaign has not yet passed its deadline.
+    CampaignNotEnded = 7,
+    // Goal was not reached; organizer cannot withdraw.
+    GoalNotReached = 8,
+    // Goal was reached; refunds are not available.
+    GoalReached = 9,
+    // Contributor has no recorded pledge to refund.
+    NoPledge = 10,
+    // Funds have already been withdrawn by the organizer.
+    AlreadyExecuted = 11,
 }
