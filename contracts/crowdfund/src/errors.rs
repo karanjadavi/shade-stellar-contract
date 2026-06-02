@@ -22,4 +22,8 @@ pub enum CrowdfundError {
     AlreadyExecuted = 11,
     // Reward for this backer has already been marked fulfilled.
     AlreadyFulfilled = 12,
+    // Contributor's total pledge is below the selected tier's minimum.
+    PledgeBelowTierMinimum = 13,
+    // The supplied tier index does not exist.
+    InvalidTier = 14,
 }

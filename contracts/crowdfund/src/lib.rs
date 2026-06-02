@@ -7,7 +7,7 @@ mod test;
 use errors::CrowdfundError;
 use soroban_sdk::{
     contract, contractevent, contractimpl, contracttype, panic_with_error, token, vec, Address,
-    Env, Vec,
+    Env, String, Vec,
 };
 
 #[contractevent]
@@ -33,6 +33,19 @@ pub struct RewardFulfilledEvent {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct RewardTier {
+    pub min_pledge: i128,
+    pub name: String,
+}
+
+#[contractevent]
+pub struct RewardTierSelectedEvent {
+    pub contributor: Address,
+    pub tier_index: u32,
+}
+
+#[contracttype]
 enum DataKey {
     Organizer,
     Token,
@@ -49,6 +62,10 @@ enum DataKey {
     StretchTriggered(u32),
     // Tracks whether the organizer has fulfilled a specific backer's reward.
     RewardFulfilled(Address),
+    // Ordered list of reward tiers set by the organizer.
+    RewardTiers,
+    // Tier index selected by a specific contributor.
+    SelectedTier(Address),
 }
 
 #[contract]
@@ -320,6 +337,67 @@ impl CrowdfundContract {
             .persistent()
             .get(&DataKey::RewardFulfilled(backer))
             .unwrap_or(false)
+    }
+
+    /// Set reward tiers for the campaign. Tiers must be in ascending order by
+    /// `min_pledge`. Only callable by the organizer.
+    pub fn set_reward_tiers(env: Env, tiers: Vec<RewardTier>) {
+        let organizer: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Organizer)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::NotInitialized));
+
+        organizer.require_auth();
+
+        let mut prev = 0_i128;
+        for tier in tiers.iter() {
+            if tier.min_pledge <= prev {
+                panic_with_error!(&env, CrowdfundError::InvalidGoal);
+            }
+            prev = tier.min_pledge;
+        }
+
+        env.storage().persistent().set(&DataKey::RewardTiers, &tiers);
+    }
+
+    /// Select a reward tier. The contributor's total pledge must meet the tier's
+    /// `min_pledge`. Replaces any previously selected tier.
+    pub fn select_reward_tier(env: Env, contributor: Address, tier_index: u32) {
+        contributor.require_auth();
+
+        let tiers: Vec<RewardTier> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RewardTiers)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::NotInitialized));
+
+        let tier = tiers
+            .get(tier_index)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::InvalidTier));
+
+        let pledge: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pledge(contributor.clone()))
+            .unwrap_or(0);
+
+        if pledge < tier.min_pledge {
+            panic_with_error!(&env, CrowdfundError::PledgeBelowTierMinimum);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SelectedTier(contributor.clone()), &tier_index);
+
+        RewardTierSelectedEvent { contributor, tier_index }.publish(&env);
+    }
+
+    /// Returns the tier index selected by a contributor, or `None` if none selected.
+    pub fn get_selected_tier(env: Env, contributor: Address) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SelectedTier(contributor))
     }
 
     /// Returns the pledge amount recorded for a given contributor.

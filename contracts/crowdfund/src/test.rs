@@ -369,3 +369,95 @@ fn test_is_fulfilled_default_false() {
 
     assert!(!client.is_fulfilled(&contributor));
 }
+
+// ── #308 – Reward tiers ───────────────────────────────────────────────────────
+
+#[test]
+fn test_select_reward_tier_maps_pledge_to_tier() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    client.set_reward_tiers(&soroban_sdk::vec![
+        &env,
+        RewardTier { min_pledge: 100, name: soroban_sdk::String::from_str(&env, "Basic") },
+        RewardTier { min_pledge: 500, name: soroban_sdk::String::from_str(&env, "Premium") },
+    ]);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &500);
+    client.contribute(&contributor, &500);
+
+    // Contributor has 500 — can select tier 1 (min 500).
+    client.select_reward_tier(&contributor, &1);
+    assert_eq!(client.get_selected_tier(&contributor), Some(1));
+}
+
+#[test]
+fn test_select_reward_tier_can_be_updated() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    client.set_reward_tiers(&soroban_sdk::vec![
+        &env,
+        RewardTier { min_pledge: 100, name: soroban_sdk::String::from_str(&env, "Basic") },
+        RewardTier { min_pledge: 500, name: soroban_sdk::String::from_str(&env, "Premium") },
+    ]);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &600);
+    client.contribute(&contributor, &600);
+
+    client.select_reward_tier(&contributor, &0);
+    assert_eq!(client.get_selected_tier(&contributor), Some(0));
+
+    // Upgrade to tier 1.
+    client.select_reward_tier(&contributor, &1);
+    assert_eq!(client.get_selected_tier(&contributor), Some(1));
+}
+
+#[test]
+#[should_panic]
+fn test_select_reward_tier_below_minimum_panics() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    client.set_reward_tiers(&soroban_sdk::vec![
+        &env,
+        RewardTier { min_pledge: 500, name: soroban_sdk::String::from_str(&env, "Premium") },
+    ]);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &100);
+    client.contribute(&contributor, &100);
+
+    // Only 100 pledged, tier requires 500 — must panic.
+    client.select_reward_tier(&contributor, &0);
+}
+
+#[test]
+#[should_panic]
+fn test_select_invalid_tier_index_panics() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    client.set_reward_tiers(&soroban_sdk::vec![
+        &env,
+        RewardTier { min_pledge: 100, name: soroban_sdk::String::from_str(&env, "Basic") },
+    ]);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &500);
+    client.contribute(&contributor, &500);
+
+    // Tier index 5 doesn't exist — must panic.
+    client.select_reward_tier(&contributor, &5);
+}
+
+#[test]
+fn test_get_selected_tier_returns_none_before_selection() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    assert_eq!(client.get_selected_tier(&contributor), None);
+}
