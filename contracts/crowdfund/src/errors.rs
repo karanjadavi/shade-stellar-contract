@@ -43,9 +43,13 @@ pub enum CrowdfundError {
     // A backer can only vote once per milestone.
     MilestoneVoteAlreadyCast = 22,
     // Shade payment gateway address has not been configured.
-    ShadeGatewayNotSet = 20,
+    ShadeGatewayNotSet = 23,
     // Merchant account address has not been configured.
-    MerchantAccountNotSet = 21,
+    MerchantAccountNotSet = 24,
     // Batch refund has already been processed.
-    RefundAlreadyProcessed = 22,
+    RefundAlreadyProcessed = 25,
+    // Sponsor matching pool cannot satisfy a match request.
+    InsufficientMatchingPool = 26,
+    // Pledge comment exceeds the configured maximum length.
+    CommentTooLong = 27,
 }

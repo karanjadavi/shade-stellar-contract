@@ -74,6 +74,24 @@ pub struct MilestoneVoteCastEvent {
     pub weight: i128,
 }
 
+#[contractevent]
+pub struct MatchingPoolFundedEvent {
+    pub sponsor: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+pub struct MatchAppliedEvent {
+    pub contributor: Address,
+    pub matched_amount: i128,
+}
+
+#[contractevent]
+pub struct PledgeCommentAddedEvent {
+    pub contributor: Address,
+    pub comment: String,
+}
+
 pub struct PledgeReceivedEvent {
     pub contributor: Address,
     pub amount: i128,
@@ -127,6 +145,10 @@ enum DataKey {
     Contributors,
     // Tracks whether batch refund has been processed.
     RefundProcessed,
+    // Sponsor funds reserved to match incoming pledges.
+    MatchingPool,
+    // Public comment attached to a contributor pledge.
+    PledgeComment(Address),
 }
 
 #[contract]
@@ -134,6 +156,7 @@ pub struct CrowdfundContract;
 
 #[contractimpl]
 impl CrowdfundContract {
+    const MAX_COMMENT_BYTES: u32 = 280;
     /// Initialise a campaign. Sets the funding goal (in token base units)
     /// and the deadline (Unix timestamp after which no contributions are
     /// accepted). Only callable once.
@@ -227,9 +250,7 @@ impl CrowdfundContract {
         MerchantAccountRefundClient::new(&env, &merchant_account)
             .refund(&token_addr, &amount, &env.current_contract_address());
 
-        let raised: i128 = env.storage().persistent().get(&DataKey::Raised).unwrap_or(0);
-        let new_raised = raised.saturating_add(amount);
-        env.storage().persistent().set(&DataKey::Raised, &new_raised);
+        let new_raised = Self::apply_pledge_with_matching(&env, contributor.clone(), amount);
 
         let prev: i128 = env.storage().persistent()
             .get(&DataKey::Pledge(contributor.clone())).unwrap_or(0);
@@ -272,29 +293,68 @@ impl CrowdfundContract {
         token::TokenClient::new(&env, &token_addr)
             .transfer(&contributor, &contract_addr, &amount);
 
-        let raised: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Raised)
-            .unwrap_or(0);
-        let new_raised = raised.saturating_add(amount);
-        env.storage().persistent().set(&DataKey::Raised, &new_raised);
-
-        // Record per-contributor pledge for potential refunds (#301).
-        let prev_pledge: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Pledge(contributor.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Pledge(contributor.clone()), &prev_pledge.saturating_add(amount));
+        let new_raised = Self::apply_pledge_with_matching(&env, contributor.clone(), amount);
 
         // Track contributor for batch refunds (#307).
         Self::track_contributor(&env, contributor);
 
         // Check and emit stretch goal events (#306).
         Self::check_stretch_goals(&env, new_raised);
+    }
+
+    /// Fund the sponsor matching pool used to amplify future pledges (#315).
+    pub fn fund_matching_pool(env: Env, sponsor: Address, amount: i128) {
+        sponsor.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, CrowdfundError::InvalidAmount);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Token)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::NotInitialized));
+        let contract_addr = env.current_contract_address();
+        token::TokenClient::new(&env, &token_addr).transfer(&sponsor, &contract_addr, &amount);
+
+        let current: i128 = env.storage().persistent().get(&DataKey::MatchingPool).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MatchingPool, &current.saturating_add(amount));
+        MatchingPoolFundedEvent { sponsor, amount }.publish(&env);
+    }
+
+    /// Attach a public comment to a contributor pledge (#314).
+    pub fn leave_comment(env: Env, contributor: Address, comment: String) {
+        contributor.require_auth();
+        let pledge: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pledge(contributor.clone()))
+            .unwrap_or(0);
+        if pledge <= 0 {
+            panic_with_error!(&env, CrowdfundError::NoPledge);
+        }
+        if comment.len() > Self::MAX_COMMENT_BYTES {
+            panic_with_error!(&env, CrowdfundError::CommentTooLong);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PledgeComment(contributor.clone()), &comment);
+        PledgeCommentAddedEvent { contributor, comment }.publish(&env);
+    }
+
+    /// Retrieve a contributor's public pledge comment, if any.
+    pub fn get_comment(env: Env, contributor: Address) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PledgeComment(contributor))
+    }
+
+    /// Read the currently available sponsor matching pool.
+    pub fn matching_pool_balance(env: Env) -> i128 {
+        env.storage().persistent().get(&DataKey::MatchingPool).unwrap_or(0)
     }
 
     /// Withdraw funds to the organizer after deadline if goal was met (#303).
@@ -881,5 +941,41 @@ impl CrowdfundContract {
                 .publish(env);
             }
         }
+    }
+
+    fn apply_pledge_with_matching(env: &Env, contributor: Address, amount: i128) -> i128 {
+        let matching_pool: i128 = env.storage().persistent().get(&DataKey::MatchingPool).unwrap_or(0);
+        let matched_amount = if matching_pool >= amount {
+            amount
+        } else {
+            matching_pool
+        };
+        if matched_amount > 0 {
+            env.storage().persistent().set(
+                &DataKey::MatchingPool,
+                &matching_pool.saturating_sub(matched_amount),
+            );
+            MatchAppliedEvent {
+                contributor: contributor.clone(),
+                matched_amount,
+            }
+            .publish(env);
+        }
+
+        let effective_amount = amount.saturating_add(matched_amount);
+        let raised: i128 = env.storage().persistent().get(&DataKey::Raised).unwrap_or(0);
+        let new_raised = raised.saturating_add(effective_amount);
+        env.storage().persistent().set(&DataKey::Raised, &new_raised);
+
+        let prev_pledge: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pledge(contributor.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pledge(contributor), &prev_pledge.saturating_add(effective_amount));
+
+        new_raised
     }
 }

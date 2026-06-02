@@ -891,3 +891,68 @@ fn test_batch_refund_panics_when_called_twice() {
     client.batch_refund();
     client.batch_refund();
 }
+
+// ── #314 / #315 / #312 – Social comments, matching, and voting ──────────────
+
+#[test]
+fn test_fund_matching_pool_doubles_next_pledge() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let sponsor = Address::generate(&env);
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &10_000, &deadline);
+
+    let token_client = StellarAssetClient::new(&env, &token);
+    token_client.mint(&sponsor, &1_000);
+    token_client.mint(&contributor, &1_000);
+
+    client.fund_matching_pool(&sponsor, &500);
+    assert_eq!(client.matching_pool_balance(), 500);
+
+    client.contribute(&contributor, &500);
+    assert_eq!(client.matching_pool_balance(), 0);
+    assert_eq!(client.pledge_of(&contributor), 1_000);
+    assert_eq!(client.raised(), 1_000);
+}
+
+#[test]
+fn test_partial_matching_when_pool_is_smaller_than_pledge() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let sponsor = Address::generate(&env);
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &10_000, &deadline);
+
+    let token_client = StellarAssetClient::new(&env, &token);
+    token_client.mint(&sponsor, &200);
+    token_client.mint(&contributor, &500);
+
+    client.fund_matching_pool(&sponsor, &200);
+    client.contribute(&contributor, &500);
+
+    assert_eq!(client.matching_pool_balance(), 0);
+    assert_eq!(client.pledge_of(&contributor), 700);
+    assert_eq!(client.raised(), 700);
+}
+
+#[test]
+fn test_leave_comment_attaches_public_metadata() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &2_000, &deadline);
+    StellarAssetClient::new(&env, &token).mint(&contributor, &500);
+    client.contribute(&contributor, &500);
+
+    let comment = soroban_sdk::String::from_str(&env, "Proud to support this launch");
+    client.leave_comment(&contributor, &comment);
+    assert_eq!(client.get_comment(&contributor), Some(comment));
+}
+
+#[test]
+#[should_panic]
+fn test_leave_comment_requires_existing_pledge() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &2_000, &deadline);
+
+    let comment = soroban_sdk::String::from_str(&env, "No pledge yet");
+    client.leave_comment(&contributor, &comment);
+}
