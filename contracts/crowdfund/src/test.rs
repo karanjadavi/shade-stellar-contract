@@ -461,3 +461,99 @@ fn test_get_selected_tier_returns_none_before_selection() {
 
     assert_eq!(client.get_selected_tier(&contributor), None);
 }
+
+// ── #311 – Milestone-based fund release ──────────────────────────────────────
+
+fn setup_milestone_campaign() -> (Env, Address, CrowdfundContractClient<'static>, Address, Address, Address) {
+    let (env, contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &10_000, &deadline);
+    // 3 milestones: 50%, 30%, 20% in basis points
+    client.set_milestones(&soroban_sdk::vec![&env, 5_000_u32, 3_000_u32, 2_000_u32]);
+    StellarAssetClient::new(&env, &token).mint(&contributor, &10_000);
+    client.contribute(&contributor, &10_000);
+    // Advance past deadline
+    env.ledger().with_mut(|l| l.timestamp += 86_401);
+    (env, contract, client, token, organizer, contributor)
+}
+
+#[test]
+fn test_release_milestone_transfers_correct_amount() {
+    let (env, _contract, client, token, organizer, _contributor) = setup_milestone_campaign();
+
+    client.unlock_milestone(&0);
+    client.release_milestone(&0);
+
+    // 50% of 10_000 = 5_000
+    assert_eq!(
+        soroban_sdk::token::TokenClient::new(&env, &token).balance(&organizer),
+        5_000
+    );
+}
+
+#[test]
+fn test_all_milestones_release_full_raised_amount() {
+    let (env, _contract, client, token, organizer, _contributor) = setup_milestone_campaign();
+
+    client.unlock_milestone(&0);
+    client.release_milestone(&0);
+    client.unlock_milestone(&1);
+    client.release_milestone(&1);
+    client.unlock_milestone(&2);
+    client.release_milestone(&2);
+
+    // 50% + 30% + 20% = 100% of 10_000
+    assert_eq!(
+        soroban_sdk::token::TokenClient::new(&env, &token).balance(&organizer),
+        10_000
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_release_milestone_without_unlock_panics() {
+    let (_env, _contract, client, _token, _organizer, _contributor) = setup_milestone_campaign();
+    // Milestone 0 not unlocked — must panic
+    client.release_milestone(&0);
+}
+
+#[test]
+#[should_panic]
+fn test_release_milestone_twice_panics() {
+    let (_env, _contract, client, _token, _organizer, _contributor) = setup_milestone_campaign();
+    client.unlock_milestone(&0);
+    client.release_milestone(&0);
+    client.release_milestone(&0); // must panic
+}
+
+#[test]
+#[should_panic]
+fn test_execute_campaign_blocked_in_milestone_mode() {
+    let (_env, _contract, client, _token, _organizer, _contributor) = setup_milestone_campaign();
+    // MilestonesActive error expected
+    client.execute_campaign();
+}
+
+#[test]
+#[should_panic]
+fn test_set_milestones_invalid_sum_panics() {
+    let (env, _contract, client, token, organizer, _) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+    // Sums to 9_000, not 10_000 — must panic
+    client.set_milestones(&soroban_sdk::vec![&env, 5_000_u32, 4_000_u32]);
+}
+
+#[test]
+#[should_panic]
+fn test_release_milestone_before_deadline_panics() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+    client.set_milestones(&soroban_sdk::vec![&env, 10_000_u32]);
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
+    client.contribute(&contributor, &1_000);
+    // Deadline not yet passed — must panic
+    client.unlock_milestone(&0);
+    client.release_milestone(&0);
+}

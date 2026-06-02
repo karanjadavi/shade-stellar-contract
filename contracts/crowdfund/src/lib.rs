@@ -45,6 +45,17 @@ pub struct RewardTierSelectedEvent {
     pub tier_index: u32,
 }
 
+#[contractevent]
+pub struct MilestoneUnlockedEvent {
+    pub index: u32,
+}
+
+#[contractevent]
+pub struct MilestoneReleasedEvent {
+    pub index: u32,
+    pub amount: i128,
+}
+
 #[contracttype]
 enum DataKey {
     Organizer,
@@ -66,6 +77,12 @@ enum DataKey {
     RewardTiers,
     // Tier index selected by a specific contributor.
     SelectedTier(Address),
+    // Milestone percentages in basis points (set by organizer, must sum to 10_000).
+    MilestonePercentages,
+    // Whether the organizer has unlocked a specific milestone for release.
+    MilestoneUnlocked(u32),
+    // Whether a specific milestone's funds have been released.
+    MilestoneReleased(u32),
 }
 
 #[contract]
@@ -204,6 +221,11 @@ impl CrowdfundContract {
 
         if executed {
             panic_with_error!(&env, CrowdfundError::AlreadyExecuted);
+        }
+
+        // Milestone mode: use release_milestone instead.
+        if env.storage().persistent().has(&DataKey::MilestonePercentages) {
+            panic_with_error!(&env, CrowdfundError::MilestonesActive);
         }
 
         env.storage().persistent().set(&DataKey::Executed, &true);
@@ -398,6 +420,148 @@ impl CrowdfundContract {
         env.storage()
             .persistent()
             .get(&DataKey::SelectedTier(contributor))
+    }
+
+    /// Define milestone percentages in basis points (1 bp = 0.01 %).
+    /// Must sum to exactly 10 000, each entry > 0. Organizer-only.
+    /// Locks the campaign into milestone mode; `execute_campaign` will be blocked.
+    pub fn set_milestones(env: Env, percentages: Vec<u32>) {
+        let organizer: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Organizer)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::NotInitialized));
+
+        organizer.require_auth();
+
+        let mut sum: u32 = 0;
+        for p in percentages.iter() {
+            if p == 0 {
+                panic_with_error!(&env, CrowdfundError::InvalidMilestonePercentages);
+            }
+            sum = sum.saturating_add(p);
+        }
+        if sum != 10_000 || percentages.len() == 0 {
+            panic_with_error!(&env, CrowdfundError::InvalidMilestonePercentages);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MilestonePercentages, &percentages);
+    }
+
+    /// Signal that a specific milestone is ready for release. Organizer-only.
+    pub fn unlock_milestone(env: Env, index: u32) {
+        let organizer: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Organizer)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::NotInitialized));
+
+        organizer.require_auth();
+
+        let percentages: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MilestonePercentages)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::MilestonesNotSet));
+
+        if index >= percentages.len() {
+            panic_with_error!(&env, CrowdfundError::InvalidMilestonePercentages);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MilestoneUnlocked(index), &true);
+
+        MilestoneUnlockedEvent { index }.publish(&env);
+    }
+
+    /// Release the proportional funds for an unlocked, unreleased milestone to the organizer.
+    /// Can only be called after the campaign deadline and goal is met.
+    pub fn release_milestone(env: Env, index: u32) {
+        let organizer: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Organizer)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::NotInitialized));
+
+        organizer.require_auth();
+
+        let deadline: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Deadline)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::NotInitialized));
+
+        if env.ledger().timestamp() <= deadline {
+            panic_with_error!(&env, CrowdfundError::CampaignNotEnded);
+        }
+
+        let goal: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Goal)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::NotInitialized));
+
+        let raised: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Raised)
+            .unwrap_or(0);
+
+        if raised < goal {
+            panic_with_error!(&env, CrowdfundError::GoalNotReached);
+        }
+
+        let percentages: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MilestonePercentages)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::MilestonesNotSet));
+
+        if index >= percentages.len() {
+            panic_with_error!(&env, CrowdfundError::InvalidMilestonePercentages);
+        }
+
+        let unlocked: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MilestoneUnlocked(index))
+            .unwrap_or(false);
+
+        if !unlocked {
+            panic_with_error!(&env, CrowdfundError::MilestoneNotUnlocked);
+        }
+
+        let released: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MilestoneReleased(index))
+            .unwrap_or(false);
+
+        if released {
+            panic_with_error!(&env, CrowdfundError::MilestoneAlreadyReleased);
+        }
+
+        let bps = percentages.get(index).unwrap() as i128;
+        let amount = raised * bps / 10_000;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MilestoneReleased(index), &true);
+
+        let token_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Token)
+            .unwrap_or_else(|| panic_with_error!(&env, CrowdfundError::NotInitialized));
+
+        let contract_addr = env.current_contract_address();
+        token::TokenClient::new(&env, &token_addr)
+            .transfer(&contract_addr, &organizer, &amount);
+
+        MilestoneReleasedEvent { index, amount }.publish(&env);
     }
 
     /// Returns the pledge amount recorded for a given contributor.
