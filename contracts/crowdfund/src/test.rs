@@ -557,3 +557,119 @@ fn test_release_milestone_before_deadline_panics() {
     client.unlock_milestone(&0);
     client.release_milestone(&0);
 }
+
+// ── #310 – Reward tier allocation constraints & fulfillment toggles ───────────
+
+fn tiers(env: &Env) -> soroban_sdk::Vec<RewardTier> {
+    soroban_sdk::vec![
+        env,
+        RewardTier { min_pledge: 200, name: soroban_sdk::String::from_str(env, "Silver") },
+        RewardTier { min_pledge: 1_000, name: soroban_sdk::String::from_str(env, "Gold") },
+    ]
+}
+
+#[test]
+fn test_tier_selection_at_exact_minimum_succeeds() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+    client.set_reward_tiers(&tiers(&env));
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &200);
+    client.contribute(&contributor, &200);
+
+    // Pledge == min_pledge exactly — must succeed.
+    client.select_reward_tier(&contributor, &0);
+    assert_eq!(client.get_selected_tier(&contributor), Some(0));
+}
+
+#[test]
+fn test_cumulative_pledge_unlocks_higher_tier() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+    client.set_reward_tiers(&tiers(&env));
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &1_000);
+    // Two separate contributions totalling 1_000.
+    client.contribute(&contributor, &600);
+    client.contribute(&contributor, &400);
+
+    // Total pledge 1_000 meets Gold tier minimum.
+    client.select_reward_tier(&contributor, &1);
+    assert_eq!(client.get_selected_tier(&contributor), Some(1));
+}
+
+#[test]
+fn test_fulfillment_is_independent_per_backer() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let contributor2 = Address::generate(&env);
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &500);
+    StellarAssetClient::new(&env, &token).mint(&contributor2, &500);
+    client.contribute(&contributor, &500);
+    client.contribute(&contributor2, &500);
+
+    client.fulfill_reward(&contributor);
+
+    // contributor fulfilled, contributor2 still not.
+    assert!(client.is_fulfilled(&contributor));
+    assert!(!client.is_fulfilled(&contributor2));
+}
+
+#[test]
+fn test_fulfillment_does_not_require_tier_selection() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &500);
+    client.contribute(&contributor, &500);
+
+    // No tier selected — fulfillment still works.
+    assert_eq!(client.get_selected_tier(&contributor), None);
+    client.fulfill_reward(&contributor);
+    assert!(client.is_fulfilled(&contributor));
+}
+
+#[test]
+#[should_panic]
+fn test_tier_one_bps_below_minimum_rejected() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+    client.set_reward_tiers(&tiers(&env));
+
+    // Pledge 199 — one below Silver minimum of 200 — must panic.
+    StellarAssetClient::new(&env, &token).mint(&contributor, &199);
+    client.contribute(&contributor, &199);
+    client.select_reward_tier(&contributor, &0);
+}
+
+#[test]
+#[should_panic]
+fn test_non_organizer_cannot_fulfill_reward() {
+    let (env, _contract, client, token, organizer, contributor) = setup();
+    let deadline = env.ledger().timestamp() + 86_400;
+    client.init_campaign(&organizer, &token, &1_000, &deadline);
+
+    StellarAssetClient::new(&env, &token).mint(&contributor, &500);
+    client.contribute(&contributor, &500);
+
+    // contributor tries to mark their own reward fulfilled — must panic (auth).
+    // We disable mock_all_auths for this check by not using the default setup env.
+    // Since setup() calls mock_all_auths, we verify the contract still guards via
+    // the organizer.require_auth() by using a fresh env without mocked auths.
+    let env2 = Env::default();
+    let contract2 = env2.register(CrowdfundContract, ());
+    let client2 = CrowdfundContractClient::new(&env2, &contract2);
+    env2.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    let org2 = Address::generate(&env2);
+    let tok2 = env2.register_stellar_asset_contract_v2(org2.clone()).address();
+    let con2 = Address::generate(&env2);
+    client2.init_campaign(&org2, &tok2, &100, &(env2.ledger().timestamp() + 1_000));
+    // No mock_all_auths — calling fulfill_reward as non-organizer must panic.
+    client2.fulfill_reward(&con2);
+}
