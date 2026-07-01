@@ -3,6 +3,8 @@
 mod errors;
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod tests;
 
 use errors::CrowdfundError;
 use soroban_sdk::{
